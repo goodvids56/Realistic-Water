@@ -38,8 +38,9 @@ dependencies {
 }
 
 tasks.named<PatchUpstream>("patchUpstream") {
-	// Forge's Mixin only knows compatibility levels up to Java 21.
+	// Forge's Mixin only knows compatibility levels up to Java 21, and logs an error for configs without a minVersion.
 	mixinCompatibilityCap = 21
+	mixinMinVersion = "0.8"
 }
 
 val generateModMetadata = tasks.register<GenerateModsToml>("generateModMetadata") {

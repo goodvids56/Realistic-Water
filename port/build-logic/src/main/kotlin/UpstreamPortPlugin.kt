@@ -111,6 +111,11 @@ abstract class PatchUpstream : DefaultTask() {
 	@get:Optional
 	abstract val mixinCompatibilityCap: Property<Int>
 
+	/// Mixin minVersion to add to upstream's configs that don't declare one (Forge's Mixin logs an error for those).
+	@get:Input
+	@get:Optional
+	abstract val mixinMinVersion: Property<String>
+
 	@get:OutputDirectory
 	abstract val outputDir: DirectoryProperty
 
@@ -144,13 +149,22 @@ abstract class PatchUpstream : DefaultTask() {
 			}
 		}
 
+		val mixinConfigs = to.walkTopDown().filter { it.isFile && it.name.endsWith(".mixins.json") }.toList()
 		if (mixinCompatibilityCap.isPresent) {
 			val cap = mixinCompatibilityCap.get()
 			val level = Regex("\"compatibilityLevel\"\\s*:\\s*\"JAVA_(\\d+)\"")
-			to.walkTopDown().filter { it.isFile && it.name.endsWith(".mixins.json") }.forEach { file ->
+			mixinConfigs.forEach { file ->
 				file.writeText(level.replace(file.readText()) { match ->
 					if (match.groupValues[1].toInt() > cap) "\"compatibilityLevel\": \"JAVA_$cap\"" else match.value
 				})
+			}
+		}
+		if (mixinMinVersion.isPresent) {
+			mixinConfigs.forEach { file ->
+				val text = file.readText()
+				if (!text.contains("\"minVersion\"")) {
+					file.writeText(text.replaceFirst("{", "{\n\t\"minVersion\": \"${mixinMinVersion.get()}\","))
+				}
 			}
 		}
 	}
