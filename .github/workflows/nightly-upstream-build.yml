@@ -1,0 +1,292 @@
+# Every night at 00:00 UTC: look at the upstream repo's current default branch
+# (upstream makes a new branch per release, e.g. 26.3-1.2.1 -> 26.3-1.2.2), and if
+# its latest commit hasn't been released here yet, build it and publish a release.
+#
+# What gets built is listed in .github/build-targets.json. "upstream" means "the
+# Minecraft version upstream's gradle.properties targets", so new upstream ports
+# (26.4, ...) are picked up automatically. Quilt reuses the Fabric jar, since Quilt
+# Loader runs Fabric mods; it is skipped when Quilt can't satisfy the mod's
+# fabricloader requirement.
+#
+# Release naming:
+#   tag    v<mod version>-mc<minecraft>-<upstream short sha>   e.g. v1.2.2-mc26.3-77dad05
+#   files  realistic-water-<mod version>+mc<minecraft>-<loader>.jar
+#          realistic-water-<mod version>+mc<minecraft>-sources.jar
+#          SHA256SUMS.txt
+
+name: Nightly upstream build
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if this upstream commit already has a release (replaces its files)
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-upstream-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: sskaffy/Realistic-Water
+
+jobs:
+  check:
+    name: Check upstream for updates
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      exists: ${{ steps.decide.outputs.exists }}
+      branch: ${{ steps.upstream.outputs.branch }}
+      sha: ${{ steps.upstream.outputs.sha }}
+      short_sha: ${{ steps.upstream.outputs.short_sha }}
+      mod_version: ${{ steps.upstream.outputs.mod_version }}
+      minecraft: ${{ steps.upstream.outputs.minecraft }}
+      java: ${{ steps.upstream.outputs.java }}
+      tag: ${{ steps.upstream.outputs.tag }}
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read upstream's current branch
+        id: upstream
+        run: |
+          set -euo pipefail
+          url="https://github.com/${UPSTREAM_REPO}.git"
+          branch=$(git ls-remote --symref "$url" HEAD | awk '$1 == "ref:" { sub("^refs/heads/", "", $2); print $2 }')
+          if [ -z "$branch" ]; then
+            echo "::error::Could not determine the default branch of ${UPSTREAM_REPO}"
+            exit 1
+          fi
+          git clone --quiet --depth 1 --branch "$branch" "$url" "$RUNNER_TEMP/upstream"
+          cd "$RUNNER_TEMP/upstream"
+
+          prop() { sed -n "s/^$1[[:space:]]*=[[:space:]]*//p" gradle.properties | tr -d '\r' | tail -n 1; }
+          sha=$(git rev-parse HEAD)
+          short_sha=$(git rev-parse --short=7 HEAD)
+          mod_version=$(prop version)
+          minecraft=$(prop minecraft_version)
+          fabric_api=$(prop fabric_api_version)
+          java=$(grep -oE 'JavaVersion\.VERSION_[0-9]+' build.gradle* | head -n 1 | grep -oE '[0-9]+$' || true)
+
+          for v in mod_version minecraft fabric_api; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Could not read $v from upstream gradle.properties"
+              exit 1
+            fi
+          done
+
+          {
+            echo "branch=$branch"
+            echo "sha=$sha"
+            echo "short_sha=$short_sha"
+            echo "mod_version=$mod_version"
+            echo "minecraft=$minecraft"
+            echo "fabric_api=$fabric_api"
+            echo "java=${java:-21}"
+            echo "tag=v${mod_version}-mc${minecraft}-${short_sha}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            exists=true
+          else
+            exists=false
+          fi
+          if [ "$exists" = false ] || [ "$FORCE" = true ]; then
+            build=true
+          else
+            build=false
+            echo "Release $TAG already exists, nothing new upstream." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve build targets
+        id: targets
+        if: steps.decide.outputs.build == 'true'
+        env:
+          MINECRAFT: ${{ steps.upstream.outputs.minecraft }}
+          FABRIC_API: ${{ steps.upstream.outputs.fabric_api }}
+        run: |
+          set -euo pipefail
+          matrix=$(python3 .github/scripts/resolve_targets.py .github/build-targets.json "$MINECRAFT" "$FABRIC_API")
+          echo "$matrix" | jq .
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Minecraft ${{ matrix.target.minecraft }}
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.check.outputs.matrix) }}
+    env:
+      MINECRAFT: ${{ matrix.target.minecraft }}
+      FABRIC_API: ${{ matrix.target.fabric_api }}
+      OVERRIDE: ${{ matrix.target.override }}
+      LOADERS: ${{ matrix.target.loaders }}
+      MOD_VERSION: ${{ needs.check.outputs.mod_version }}
+    steps:
+      - name: Check out upstream source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ needs.check.outputs.java }}
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$OVERRIDE" = true ]; then
+            args+=("-Pminecraft_version=$MINECRAFT" "-Pfabric_api_version=$FABRIC_API")
+            sed -i -E 's/("minecraft"[[:space:]]*:[[:space:]]*")[^"]*"/\1~'"$MINECRAFT"'"/' src/main/resources/fabric.mod.json
+          fi
+          chmod +x gradlew
+          ./gradlew build "${args[@]}" --stacktrace
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          jar=$(find build/libs -maxdepth 1 -name '*.jar' ! -name '*-sources.jar' ! -name '*-dev.jar' | head -n 1)
+          sources=$(find build/libs -maxdepth 1 -name '*-sources.jar' | head -n 1)
+          if [ -z "$jar" ]; then
+            echo "::error::No mod jar in build/libs"
+            exit 1
+          fi
+
+          base="realistic-water-${MOD_VERSION}+mc${MINECRAFT}"
+          mkdir -p dist
+          notes=dist/notes.md
+          fabricloader=$(jq -r '.depends.fabricloader // empty' src/main/resources/fabric.mod.json 2>/dev/null || true)
+          required=$(grep -oE '[0-9]+(\.[0-9]+)*' <<<"$fabricloader" | head -n 1 || true)
+
+          for loader in $LOADERS; do
+            case "$loader" in
+              fabric)
+                cp "$jar" "dist/$base-fabric.jar"
+                echo "- \`$base-fabric.jar\`: Fabric, Minecraft $MINECRAFT. Needs Fabric Loader ${fabricloader:-(any)} and Fabric API." >> "$notes"
+                ;;
+              quilt)
+                reason=""
+                if ! curl -fsSL https://meta.quiltmc.org/v3/versions/game | jq -e --arg mc "$MINECRAFT" 'any(.[]; .version == $mc)' >/dev/null; then
+                  reason="Quilt doesn't support Minecraft $MINECRAFT yet"
+                else
+                  quilt=$(curl -fsSL https://meta.quiltmc.org/v3/versions/loader | jq -r '.[0].version')
+                  curl -fsSL -o "$RUNNER_TEMP/quilt-loader.jar" \
+                    "https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-loader/$quilt/quilt-loader-$quilt.jar"
+                  provided=$(unzip -p "$RUNNER_TEMP/quilt-loader.jar" quilt.mod.json \
+                    | jq -r '.quilt_loader.provides[]? | select(type == "object" and .id == "fabricloader") | .version')
+                  if [ -n "$required" ] && [ "$(printf '%s\n%s\n' "$required" "$provided" | sort -V | head -n 1)" != "$required" ]; then
+                    reason="the mod needs fabricloader $fabricloader but the newest Quilt Loader ($quilt) only provides $provided"
+                  fi
+                fi
+                if [ -n "$reason" ]; then
+                  echo "::warning::Skipping Quilt for Minecraft $MINECRAFT: $reason"
+                  echo "- Quilt for Minecraft $MINECRAFT skipped: $reason." >> "$notes"
+                else
+                  cp "$jar" "dist/$base-quilt.jar"
+                  echo "- \`$base-quilt.jar\`: Quilt, Minecraft $MINECRAFT. Needs Quilt Loader $quilt or newer and Fabric API." >> "$notes"
+                fi
+                ;;
+            esac
+          done
+          if [ -n "$sources" ]; then
+            cp "$sources" "dist/$base-sources.jar"
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-mc${{ matrix.target.minecraft }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [check, build]
+    if: ${{ !cancelled() && needs.check.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: build-mc*
+          path: artifacts
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATRIX: ${{ needs.check.outputs.matrix }}
+          TAG: ${{ needs.check.outputs.tag }}
+          EXISTS: ${{ needs.check.outputs.exists }}
+          BRANCH: ${{ needs.check.outputs.branch }}
+          SHA: ${{ needs.check.outputs.sha }}
+          SHORT_SHA: ${{ needs.check.outputs.short_sha }}
+          MOD_VERSION: ${{ needs.check.outputs.mod_version }}
+          MINECRAFT: ${{ needs.check.outputs.minecraft }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          files="" failed=""
+          for mc in $(jq -r '.[].minecraft' <<<"$MATRIX"); do
+            dir="artifacts/build-mc$mc"
+            if [ -d "$dir" ]; then
+              cp "$dir"/*.jar release/
+              files+=$(cat "$dir/notes.md")$'\n'
+            else
+              primary=$(jq -r --arg mc "$mc" '.[] | select(.minecraft == $mc) | .primary' <<<"$MATRIX")
+              if [ "$primary" = true ]; then
+                echo "::error::The build for upstream's own target (Minecraft $mc) failed; not releasing."
+                exit 1
+              fi
+              failed+="- Minecraft $mc"$'\n'
+            fi
+          done
+          (cd release && sha256sum *.jar > SHA256SUMS.txt)
+
+          {
+            echo "Automated build of [${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO}) branch \`${BRANCH}\`, commit [\`${SHORT_SHA}\`](https://github.com/${UPSTREAM_REPO}/commit/${SHA})."
+            echo
+            echo "### Files"
+            echo
+            printf '%s' "$files"
+            echo
+            echo "Use the \`-fabric\` or \`-quilt\` jar for your loader; the \`-sources\` jar is the source code. Checksums are in \`SHA256SUMS.txt\`."
+            if [ -n "$failed" ]; then
+              echo
+              echo "### Targets that failed to build"
+              echo
+              printf '%s' "$failed"
+            fi
+          } > notes.md
+          cat notes.md
+
+          title="Realistic Water ${MOD_VERSION} for Minecraft ${MINECRAFT} (${SHORT_SHA})"
+          if [ "$EXISTS" = true ]; then
+            gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$title" --notes-file notes.md
+          else
+            gh release create "$TAG" release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$title" --notes-file notes.md --latest
+          fi
