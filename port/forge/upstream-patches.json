@@ -1,0 +1,20 @@
+[
+	{
+		"why": "Forge passes block ModelData to ModelBlockRenderer.tesselateBlock, so the wrapped call has one more argument.",
+		"file": "src/client/java/me/skaffy/client/mixin/SectionCompilerMixin.java",
+		"find": "BlockStateModel;J)V\"))",
+		"replace": "BlockStateModel;JLnet/minecraftforge/client/model/data/ModelData;)V\"))"
+	},
+	{
+		"why": "See above: accept the extra ModelData argument.",
+		"file": "src/client/java/me/skaffy/client/mixin/SectionCompilerMixin.java",
+		"find": "BlockStateModel model, long seed, Operation<Void> original) {",
+		"replace": "BlockStateModel model, long seed, net.minecraftforge.client.model.data.ModelData modelData, Operation<Void> original) {"
+	},
+	{
+		"why": "See above: pass the ModelData through.",
+		"file": "src/client/java/me/skaffy/client/mixin/SectionCompilerMixin.java",
+		"find": "original.call(renderer, output, x, y, z, region, pos, state, model, seed);",
+		"replace": "original.call(renderer, output, x, y, z, region, pos, state, model, seed, modelData);"
+	}
+]

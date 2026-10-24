@@ -4,9 +4,14 @@
 #
 # What gets built is listed in .github/build-targets.json. "upstream" means "the
 # Minecraft version upstream's gradle.properties targets", so new upstream ports
-# (26.4, ...) are picked up automatically. Quilt reuses the Fabric jar, since Quilt
-# Loader runs Fabric mods; it is skipped when Quilt can't satisfy the mod's
-# fabricloader requirement.
+# (26.4, ...) are picked up automatically.
+#   fabric    upstream's own build
+#   quilt     the Fabric jar (Quilt Loader runs Fabric mods); skipped when Quilt can't
+#             satisfy the mod's fabricloader requirement
+#   neoforge  upstream's source built through port/neoforge against the newest NeoForge
+#   forge     upstream's source built through port/forge against the newest Forge
+# Only upstream's own Fabric build has to succeed for a release; anything else that
+# fails is listed in the release notes.
 #
 # Release naming:
 #   tag    v<mod version>-mc<minecraft>-<upstream short sha>   e.g. v1.2.2-mc26.3-77dad05
@@ -127,7 +132,7 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build Minecraft ${{ matrix.target.minecraft }}
+    name: Build ${{ matrix.target.build }} for Minecraft ${{ matrix.target.minecraft }}
     needs: check
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
@@ -136,17 +141,25 @@ jobs:
       matrix:
         target: ${{ fromJSON(needs.check.outputs.matrix) }}
     env:
+      BUILD: ${{ matrix.target.build }}
       MINECRAFT: ${{ matrix.target.minecraft }}
       FABRIC_API: ${{ matrix.target.fabric_api }}
+      LOADER_VERSION: ${{ matrix.target.loader_version }}
       OVERRIDE: ${{ matrix.target.override }}
       LOADERS: ${{ matrix.target.loaders }}
       MOD_VERSION: ${{ needs.check.outputs.mod_version }}
     steps:
+      - name: Check out this repository
+        uses: actions/checkout@main
+        with:
+          path: fork
+
       - name: Check out upstream source
         uses: actions/checkout@main
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.check.outputs.sha }}
+          path: upstream
 
       - uses: actions/setup-java@main
         with:
@@ -158,34 +171,59 @@ jobs:
       - name: Build
         run: |
           set -euo pipefail
-          args=()
-          if [ "$OVERRIDE" = true ]; then
-            args+=("-Pminecraft_version=$MINECRAFT" "-Pfabric_api_version=$FABRIC_API")
-            sed -i -E 's/("minecraft"[[:space:]]*:[[:space:]]*")[^"]*"/\1~'"$MINECRAFT"'"/' src/main/resources/fabric.mod.json
-          fi
-          chmod +x gradlew
-          ./gradlew build "${args[@]}" --stacktrace
+          case "$BUILD" in
+            fabric)
+              cd upstream
+              args=()
+              if [ "$OVERRIDE" = true ]; then
+                args+=("-Pminecraft_version=$MINECRAFT" "-Pfabric_api_version=$FABRIC_API")
+                sed -i -E 's/("minecraft"[[:space:]]*:[[:space:]]*")[^"]*"/\1~'"$MINECRAFT"'"/' src/main/resources/fabric.mod.json
+              fi
+              chmod +x gradlew
+              ./gradlew build "${args[@]}" --stacktrace
+              ;;
+            neoforge | forge)
+              chmod +x fork/port/gradlew
+              fork/port/gradlew -p "fork/port/$BUILD" build --stacktrace \
+                "-Pupstream_dir=$GITHUB_WORKSPACE/upstream" "-P${BUILD}_version=$LOADER_VERSION"
+              ;;
+          esac
 
       - name: Package
         run: |
           set -euo pipefail
+          base="realistic-water-${MOD_VERSION}+mc${MINECRAFT}"
+          dist="$GITHUB_WORKSPACE/dist"
+          notes="$dist/notes.md"
+          mkdir -p "$dist"
+
+          if [ "$BUILD" != fabric ]; then
+            jar="fork/port/$BUILD/build/libs/realistic-water-$BUILD-$MOD_VERSION.jar"
+            if [ ! -f "$jar" ]; then
+              echo "::error::No mod jar at $jar"
+              exit 1
+            fi
+            cp "$jar" "$dist/$base-$BUILD.jar"
+            name=$([ "$BUILD" = neoforge ] && echo NeoForge || echo Forge)
+            echo "- \`$base-$BUILD.jar\`: $name, Minecraft $MINECRAFT. Built against $name $LOADER_VERSION; needs that or newer. No Fabric API needed." >> "$notes"
+            ls -l "$dist"
+            exit 0
+          fi
+
+          cd upstream
           jar=$(find build/libs -maxdepth 1 -name '*.jar' ! -name '*-sources.jar' ! -name '*-dev.jar' | head -n 1)
           sources=$(find build/libs -maxdepth 1 -name '*-sources.jar' | head -n 1)
           if [ -z "$jar" ]; then
             echo "::error::No mod jar in build/libs"
             exit 1
           fi
-
-          base="realistic-water-${MOD_VERSION}+mc${MINECRAFT}"
-          mkdir -p dist
-          notes=dist/notes.md
           fabricloader=$(jq -r '.depends.fabricloader // empty' src/main/resources/fabric.mod.json 2>/dev/null || true)
           required=$(grep -oE '[0-9]+(\.[0-9]+)*' <<<"$fabricloader" | head -n 1 || true)
 
           for loader in $LOADERS; do
             case "$loader" in
               fabric)
-                cp "$jar" "dist/$base-fabric.jar"
+                cp "$jar" "$dist/$base-fabric.jar"
                 echo "- \`$base-fabric.jar\`: Fabric, Minecraft $MINECRAFT. Needs Fabric Loader ${fabricloader:-(any)} and Fabric API." >> "$notes"
                 ;;
               quilt)
@@ -206,20 +244,20 @@ jobs:
                   echo "::warning::Skipping Quilt for Minecraft $MINECRAFT: $reason"
                   echo "- Quilt for Minecraft $MINECRAFT skipped: $reason." >> "$notes"
                 else
-                  cp "$jar" "dist/$base-quilt.jar"
+                  cp "$jar" "$dist/$base-quilt.jar"
                   echo "- \`$base-quilt.jar\`: Quilt, Minecraft $MINECRAFT. Needs Quilt Loader $quilt or newer and Fabric API." >> "$notes"
                 fi
                 ;;
             esac
           done
           if [ -n "$sources" ]; then
-            cp "$sources" "dist/$base-sources.jar"
+            cp "$sources" "$dist/$base-sources.jar"
           fi
-          ls -l dist
+          ls -l "$dist"
 
       - uses: actions/upload-artifact@main
         with:
-          name: build-mc${{ matrix.target.minecraft }}
+          name: build-${{ matrix.target.id }}
           path: dist/
           if-no-files-found: error
 
@@ -231,7 +269,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@main
         with:
-          pattern: build-mc*
+          pattern: build-*
           path: artifacts
 
       - name: Create or update release
@@ -249,20 +287,19 @@ jobs:
           set -euo pipefail
           mkdir -p release
           files="" failed=""
-          for mc in $(jq -r '.[].minecraft' <<<"$MATRIX"); do
-            dir="artifacts/build-mc$mc"
+          while read -r id build minecraft primary; do
+            dir="artifacts/build-$id"
             if [ -d "$dir" ]; then
               cp "$dir"/*.jar release/
               files+=$(cat "$dir/notes.md")$'\n'
             else
-              primary=$(jq -r --arg mc "$mc" '.[] | select(.minecraft == $mc) | .primary' <<<"$MATRIX")
               if [ "$primary" = true ]; then
-                echo "::error::The build for upstream's own target (Minecraft $mc) failed; not releasing."
+                echo "::error::Upstream's own Fabric build (Minecraft $minecraft) failed; not releasing."
                 exit 1
               fi
-              failed+="- Minecraft $mc"$'\n'
+              failed+="- $build for Minecraft $minecraft"$'\n'
             fi
-          done
+          done < <(jq -r '.[] | "\(.id) \(.build) \(.minecraft) \(.primary)"' <<<"$MATRIX")
           (cd release && sha256sum *.jar > SHA256SUMS.txt)
 
           {
@@ -272,12 +309,14 @@ jobs:
             echo
             printf '%s' "$files"
             echo
-            echo "Use the \`-fabric\` or \`-quilt\` jar for your loader; the \`-sources\` jar is the source code. Checksums are in \`SHA256SUMS.txt\`."
+            echo "Pick the jar for your loader; the \`-sources\` jar is the source code. Checksums are in \`SHA256SUMS.txt\`."
             if [ -n "$failed" ]; then
               echo
-              echo "### Targets that failed to build"
+              echo "### Builds that failed"
               echo
               printf '%s' "$failed"
+              echo
+              echo "See this release's workflow run for the build logs."
             fi
           } > notes.md
           cat notes.md

@@ -2,7 +2,7 @@
   "targets": [
     {
       "minecraft": "upstream",
-      "loaders": ["fabric", "quilt"]
+      "loaders": ["fabric", "quilt", "neoforge", "forge"]
     }
   ]
 }

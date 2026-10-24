@@ -1,0 +1,9 @@
+[
+	{
+		"why": "NeoForge splits SectionCompiler.compile into an overload that delegates to a new one taking extra section renderers. Mixin binds a name-only selector to the first overload, which has neither call, so target every overload.",
+		"file": "src/client/java/me/skaffy/client/mixin/SectionCompilerMixin.java",
+		"find": "@WrapOperation(method = \"compile\",",
+		"replace": "@WrapOperation(method = \"compile*\",",
+		"count": 2
+	}
+]
