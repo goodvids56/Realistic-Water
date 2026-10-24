@@ -52,7 +52,7 @@ jobs:
       tag: ${{ steps.upstream.outputs.tag }}
       matrix: ${{ steps.targets.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@main
 
       - name: Read upstream's current branch
         id: upstream
@@ -143,17 +143,17 @@ jobs:
       MOD_VERSION: ${{ needs.check.outputs.mod_version }}
     steps:
       - name: Check out upstream source
-        uses: actions/checkout@v7
+        uses: actions/checkout@main
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.check.outputs.sha }}
 
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@main
         with:
           distribution: temurin
           java-version: ${{ needs.check.outputs.java }}
 
-      - uses: gradle/actions/setup-gradle@v6
+      - uses: gradle/actions/setup-gradle@main
 
       - name: Build
         run: |
@@ -217,7 +217,7 @@ jobs:
           fi
           ls -l dist
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@main
         with:
           name: build-mc${{ matrix.target.minecraft }}
           path: dist/
@@ -229,7 +229,7 @@ jobs:
     if: ${{ !cancelled() && needs.check.outputs.build == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@main
         with:
           pattern: build-mc*
           path: artifacts
